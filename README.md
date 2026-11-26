@@ -19,3 +19,15 @@ Worker inside the Cloudflare Free plan limits).
 
 Download base URL (`CONFIG_RAW_BASE`):
 `https://auroratunnel.github.io/pulse-tunnel-configs`
+
+## Installable builds
+
+GitHub **Releases** on this repo carry the signed APKs produced by the
+`Build Android APK` workflow of the private source repo, so end users can
+install Pulse Tunnel without GitHub access:
+
+- arm64-v8a (most modern phones)
+- armeabi-v7a (older/entry-level phones)
+
+Release assets live outside the branch tree, so they never interfere with the
+config files the app downloads above.
