@@ -1,0 +1,146 @@
+# =============================================================================
+# Install the full Pulse Tunnel stack on a VPS.
+#
+# Triggered by the admin panel's "Install" button via repository_dispatch:
+#   POST /repos/{owner}/{repo}/dispatches
+#   { "event_type": "install-vps",
+#     "client_payload": { "vps_ip", "vps_password", "pki_b64" } }
+#
+# The panel cannot SSH itself (Cloudflare Workers have no outbound TCP), so the
+# install is executed here on a GitHub-hosted runner instead.
+#
+# Credentials are passed through client_payload and immediately masked so they
+# never appear in the job log. The panel polls the run status — no callback.
+# =============================================================================
+name: Install Pulse Stack on VPS
+
+on:
+  repository_dispatch:
+    types: [install-vps]
+  workflow_dispatch:
+    inputs:
+      vps_ip:
+        description: "VPS public IP"
+        required: true
+        type: string
+      vps_password:
+        description: "VPS root password"
+        required: true
+        type: string
+      pki_b64:
+        description: "base64 tar.gz of the shared OpenVPN CA (optional)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: pulse-install
+  cancel-in-progress: false
+
+jobs:
+  install:
+    name: Install on VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      VPS_IP: ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+      VPS_PASSWORD: ${{ github.event.client_payload.vps_password || github.event.inputs.vps_password }}
+      PKI_B64: ${{ github.event.client_payload.pki_b64 || github.event.inputs.pki_b64 }}
+
+    steps:
+      - name: Checkout installer
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "$VPS_IP" ]; then echo "::error::vps_ip is missing"; exit 1; fi
+          if [ -z "$VPS_PASSWORD" ]; then echo "::error::vps_password is missing"; exit 1; fi
+          # IPv4 sanity — the installer uses it for the TLS SAN
+          if ! printf '%s' "$VPS_IP" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+            echo "::error::vps_ip is not an IPv4 address"; exit 1
+          fi
+          echo "Target: $VPS_IP"
+
+      - name: Mask credentials
+        run: echo "::add-mask::$VPS_PASSWORD"
+
+      - name: Install sshpass
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      - name: Copy installer to the VPS
+        env:
+          SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          touch ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+          # accept the host key without prompting (runner is ephemeral)
+          ssh-keyscan -H "$VPS_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
+
+          # shellcheck disable=SC2086
+          SSHPASS="$VPS_PASSWORD" sshpass -e scp $SSH_OPTS \
+            install/pulse-install.sh "root@${VPS_IP}:/tmp/pulse-install.sh"
+
+          # The shared OpenVPN CA, if the panel supplied one: reusing it is what
+          # keeps the already-shipped client profiles verifying against the new
+          # server. Without it a fresh CA is generated and repoint must re-embed.
+          if [ -n "$PKI_B64" ]; then
+            printf '%s' "$PKI_B64" | base64 -d > /tmp/pulse-pki.tgz
+            # shellcheck disable=SC2086
+            SSHPASS="$VPS_PASSWORD" sshpass -e scp $SSH_OPTS \
+              /tmp/pulse-pki.tgz "root@${VPS_IP}:/tmp/pulse-pki.tgz"
+            echo "OpenVPN CA payload delivered"
+          fi
+          echo "installer copied"
+
+      - name: Run installer
+        env:
+          SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR
+        run: |
+          set -euo pipefail
+          PKI_ARG=""
+          if [ -n "$PKI_B64" ]; then
+            # decode on the VPS side and hand the script the base64 it expects
+            PKI_B64_REMOTE="$(sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+              'base64 -w0 /tmp/pulse-pki.tgz' 2>/dev/null || true)"
+            if [ -n "$PKI_B64_REMOTE" ]; then
+              PKI_ARG="--pki-b64 ${PKI_B64_REMOTE}"
+            fi
+          fi
+
+          # Detached inside the session so a transient TCP reset cannot kill the
+          # install halfway; we then poll its log to completion.
+          # shellcheck disable=SC2086
+          SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+            "rm -f /tmp/pulse-install.log; nohup bash /tmp/pulse-install.sh --ip ${VPS_IP} ${PKI_ARG} >/tmp/pulse-install.log 2>&1 & echo LAUNCHED"
+
+          for i in $(seq 1 150); do
+            sleep 10
+            # shellcheck disable=SC2086
+            STATE=$(SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+              'grep -qE "ALL PORTS ACTIVE|SOME PORTS MISSING" /tmp/pulse-install.log 2>/dev/null && echo DONE || echo RUNNING' \
+              2>/dev/null || echo SSH_BLIP)
+            echo "poll $i: $STATE"
+            [ "$STATE" = "DONE" ] && break
+          done
+
+          echo "=== install log ==="
+          # shellcheck disable=SC2086
+          SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+            'cat /tmp/pulse-install.log' 2>/dev/null || true
+
+          echo "=== result ==="
+          # shellcheck disable=SC2086
+          RESULT=$(SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+            'grep -c "ALL PORTS ACTIVE" /tmp/pulse-install.log 2>/dev/null || true' 2>/dev/null || echo 0)
+          if [ "${RESULT:-0}" -ge 1 ]; then
+            echo "::notice::Install complete — all ports active on $VPS_IP"
+          else
+            echo "::error::Install did not report ALL PORTS ACTIVE on $VPS_IP"
+            exit 1
+          fi
