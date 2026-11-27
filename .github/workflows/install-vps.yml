@@ -62,9 +62,12 @@ jobs:
       - name: Mask credentials
         run: |
           set -euo pipefail
-          # jq reads the raw event payload. Referencing the values with
-          # ${{ }} instead would interpolate them into the script body, which
-          # GitHub also prints — so the file is the only leak-free source.
+          # jq reads the raw event payload. Writing the values as a GitHub
+          # expression instead would interpolate them into the script body,
+          # which GitHub also prints — so the event file is the only
+          # leak-free source. (Never put an empty expression in here either:
+          # GitHub scans run: blocks for the expression opener and rejects the
+          # whole workflow file if it finds nothing between the braces.)
           PW=$(jq -r '.client_payload.vps_password // .inputs.vps_password // empty' "$GITHUB_EVENT_PATH")
           PKI=$(jq -r '.client_payload.pki_b64 // .inputs.pki_b64 // empty' "$GITHUB_EVENT_PATH")
           if [ -n "$PW" ]; then
