@@ -89,9 +89,8 @@ workflow therefore:
 2. Keeps the password and PKI at **step level** on the two steps that need them
    — by then they render as `***`.
 3. Never puts an expression opener inside a `run:` block. GitHub scans `run:`
-   blocks for {% raw %}`${{`{% endraw %}, and an empty pair is a parse error
-   for the *whole file* —
-   which manifests as `repository_dispatch` returning 204 while scheduling
-   nothing at all.
+   blocks for a dollar sign followed by two open braces, and an empty pair is
+   a parse error for the *whole file* — which manifests as
+   `repository_dispatch` returning 204 while scheduling nothing at all.
 
 Verified: password and `pki_b64` appear **zero** times in clear across run logs.
