@@ -531,7 +531,13 @@ grep -qxF "${U}:${P}" /etc/openvpn/pulse-users
 AUTH
 chmod 755 "$OVPN_DIR/check_auth.sh"
 echo 'pulse:a0Q8W7FtyytEwOjZ' > "$OVPN_DIR/pulse-users"
-chmod 600 "$OVPN_DIR/pulse-users"
+# check_auth.sh runs as `nobody` — the server config drops privileges via
+# `user nobody` / `group nogroup` — so a root-only 600 file makes the script's
+# grep fail with "Permission denied". Auth then never completes, the server
+# never answers PUSH_REQUEST, and every client hangs forever waiting. (Seen on
+# BOTH the reference and a fresh install; 1081 of 1198 payloads are OpenVPN.)
+chown nobody:nogroup "$OVPN_DIR/pulse-users"
+chmod 400 "$OVPN_DIR/pulse-users"
 
 write_ovpn() { # $1=conf  $2=port  $3=proto  $4=subnet  $5=status
   cat > "$OVPN_DIR/server/$1" <<CONF
