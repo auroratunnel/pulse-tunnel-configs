@@ -411,6 +411,13 @@ server {
 SNI
 
 ln -sfn /etc/nginx/sites-available/pulse /etc/nginx/sites-enabled/pulse
+# Debian ships sites-enabled/default with `listen 80 default_server`, which
+# collides with the one above: nginx then refuses to start with
+#   [emerg] a duplicate default server for 0.0.0.0:80
+# and stage 6's `nginx -t || die` aborts the whole install. The reference box
+# has only `pulse` enabled, so the stock site has to go too. (Checked: the
+# stunnel4 ENABLED=0 default is harmless — its init script never reads it.)
+rm -f /etc/nginx/sites-enabled/default
 
 # make sure the stream block exists exactly once
 if ! grep -qE '^\s*stream\s*\{' /etc/nginx/nginx.conf; then
