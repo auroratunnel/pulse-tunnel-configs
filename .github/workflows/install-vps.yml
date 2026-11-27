@@ -7,10 +7,19 @@
 #     "client_payload": { "vps_ip", "vps_password", "pki_b64" } }
 #
 # The panel cannot SSH itself (Cloudflare Workers have no outbound TCP), so the
-# install is executed here on a GitHub-hosted runner instead.
+# install is executed here on a GitHub-hosted runner instead. The panel polls
+# the run status — no callback, and no credential ever stored panel-side.
 #
-# Credentials are passed through client_payload and immediately masked so they
-# never appear in the job log. The panel polls the run status — no callback.
+# ── Why the first step is "Mask credentials" ──────────────────────────────────
+# GitHub prints an `env:` group at the start of EVERY step. Any secret sitting
+# in `env:` is therefore written to the log verbatim for every step that runs
+# BEFORE ::add-mask:: registers it — job-level env made the root password and
+# the OpenVPN CA (which contains server.key) appear in plaintext in steps 2-4.
+#
+# So: this step runs FIRST, has NO `env:` block at all, and reads the values
+# out of $GITHUB_EVENT_PATH with jq. Nothing to print, nothing to leak. Later
+# steps declare the secrets in their own step-level `env:` — by then they are
+# registered, so the same dump renders them as `***`.
 # =============================================================================
 name: Install Pulse Stack on VPS
 
@@ -43,28 +52,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
+    # Only the non-secret target IP lives at job level. The password and the
+    # PKI are deliberately NOT here — see the header comment.
     env:
       VPS_IP: ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
-      VPS_PASSWORD: ${{ github.event.client_payload.vps_password || github.event.inputs.vps_password }}
-      PKI_B64: ${{ github.event.client_payload.pki_b64 || github.event.inputs.pki_b64 }}
 
     steps:
-      - name: Checkout installer
-        uses: actions/checkout@v4
+      # MUST stay first, and MUST stay free of any `env:` block.
+      - name: Mask credentials
+        run: |
+          set -euo pipefail
+          # jq reads the raw event payload. Referencing the values with
+          # ${{ }} instead would interpolate them into the script body, which
+          # GitHub also prints — so the file is the only leak-free source.
+          PW=$(jq -r '.client_payload.vps_password // .inputs.vps_password // empty' "$GITHUB_EVENT_PATH")
+          PKI=$(jq -r '.client_payload.pki_b64 // .inputs.pki_b64 // empty' "$GITHUB_EVENT_PATH")
+          if [ -n "$PW" ]; then
+            echo "::add-mask::$PW"
+            echo "root password registered for masking"
+          else
+            echo "::error::vps_password missing from the event payload"
+            exit 1
+          fi
+          if [ -n "$PKI" ]; then
+            # The CA bundle carries server.key (a private key) — mask it too.
+            echo "::add-mask::$PKI"
+            echo "OpenVPN CA registered for masking"
+          else
+            echo "no OpenVPN CA supplied (a fresh one will be generated)"
+          fi
 
       - name: Validate inputs
+        env:
+          VPS_PASSWORD_PRESENT: ${{ (github.event.client_payload.vps_password || github.event.inputs.vps_password) && 'yes' || 'no' }}
         run: |
           set -euo pipefail
           if [ -z "$VPS_IP" ]; then echo "::error::vps_ip is missing"; exit 1; fi
-          if [ -z "$VPS_PASSWORD" ]; then echo "::error::vps_password is missing"; exit 1; fi
-          # IPv4 sanity — the installer uses it for the TLS SAN
+          if [ "$VPS_PASSWORD_PRESENT" != "yes" ]; then echo "::error::vps_password is missing"; exit 1; fi
+          # IPv4 sanity — the installer also uses it for the TLS certificate SAN
           if ! printf '%s' "$VPS_IP" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             echo "::error::vps_ip is not an IPv4 address"; exit 1
           fi
           echo "Target: $VPS_IP"
 
-      - name: Mask credentials
-        run: echo "::add-mask::$VPS_PASSWORD"
+      - name: Checkout installer
+        uses: actions/checkout@v4
 
       - name: Install sshpass
         run: |
@@ -74,6 +106,10 @@ jobs:
 
       - name: Copy installer to the VPS
         env:
+          # Step-level only, and already masked by the first step — the env
+          # dump below renders these as ***.
+          VPS_PASSWORD: ${{ github.event.client_payload.vps_password || github.event.inputs.vps_password }}
+          PKI_B64: ${{ github.event.client_payload.pki_b64 || github.event.inputs.pki_b64 }}
           SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR
         run: |
           set -euo pipefail
@@ -94,18 +130,22 @@ jobs:
             # shellcheck disable=SC2086
             SSHPASS="$VPS_PASSWORD" sshpass -e scp $SSH_OPTS \
               /tmp/pulse-pki.tgz "root@${VPS_IP}:/tmp/pulse-pki.tgz"
+            rm -f /tmp/pulse-pki.tgz
             echo "OpenVPN CA payload delivered"
           fi
           echo "installer copied"
 
       - name: Run installer
         env:
+          VPS_PASSWORD: ${{ github.event.client_payload.vps_password || github.event.inputs.vps_password }}
+          PKI_B64: ${{ github.event.client_payload.pki_b64 || github.event.inputs.pki_b64 }}
           SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o LogLevel=ERROR
         run: |
           set -euo pipefail
           PKI_ARG=""
           if [ -n "$PKI_B64" ]; then
-            # decode on the VPS side and hand the script the base64 it expects
+            # read it back off the VPS rather than echoing the local copy, and
+            # keep it out of `set -x`-style output by never printing it
             PKI_B64_REMOTE="$(sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
               'base64 -w0 /tmp/pulse-pki.tgz' 2>/dev/null || true)"
             if [ -n "$PKI_B64_REMOTE" ]; then
