@@ -149,7 +149,7 @@ jobs:
           if [ -n "$PKI_B64" ]; then
             # read it back off the VPS rather than echoing the local copy, and
             # keep it out of `set -x`-style output by never printing it
-            PKI_B64_REMOTE="$(sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
+            PKI_B64_REMOTE="$(SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
               'base64 -w0 /tmp/pulse-pki.tgz' 2>/dev/null || true)"
             if [ -n "$PKI_B64_REMOTE" ]; then
               PKI_ARG="--pki-b64 ${PKI_B64_REMOTE}"

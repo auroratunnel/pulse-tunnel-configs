@@ -501,12 +501,24 @@ if [ ! -f "$PKI_DIR/pki/ca.crt" ]; then
   log "    generating a fresh OpenVPN CA"
   command -v easyrsa >/dev/null 2>&1 && EASYRSA="$(command -v easyrsa)" \
     || EASYRSA=/usr/share/easy-rsa/easyrsa
-  ( cd "$PKI_DIR" \
-    && "$EASYRSA" init-pki --batch >/dev/null 2>&1 \
-    && "$EASYRSA" build-ca --batch nopass >/dev/null 2>&1 \
-    && "$EASYRSA" build-server-full --batch server nopass >/dev/null 2>&1 )
-  [ -f "$PKI_DIR/pki/ca.crt" ] || die "OpenVPN CA generation failed"
-  ok "fresh CA generated (REPOINT WILL NEED TO RE-EMBED IT)"
+  # --batch is a GLOBAL option in EasyRSA 3.2.x (Debian 13). Written after the
+  # subcommand it is rejected with "Unknown command option: '--batch'", so
+  # build-ca never runs and build-server-full then fails on "Missing expected
+  # CA file". Put it first. Output is captured rather than discarded so a
+  # failure shows the real reason instead of a bare line number.
+  ealog="$(mktemp)"
+  if ( cd "$PKI_DIR" \
+       && "$EASYRSA" --batch init-pki \
+       && "$EASYRSA" --batch build-ca nopass \
+       && "$EASYRSA" --batch build-server-full server nopass ) >"$ealog" 2>&1; then
+    ok "fresh CA generated (REPOINT WILL NEED TO RE-EMBED IT)"
+  else
+    warn "easy-rsa failed — last output:"
+    tail -20 "$ealog" | sed 's/^/    /' || true
+    rm -f "$ealog"
+    die "OpenVPN CA generation failed"
+  fi
+  rm -f "$ealog"
 fi
 
 cat > "$OVPN_DIR/check_auth.sh" <<'AUTH'
