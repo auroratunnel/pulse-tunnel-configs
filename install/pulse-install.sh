@@ -39,7 +39,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-log()  { printf '\033[1;36m[pulse]\033[0m %s\n' "$*"; }
+# Elapsed time on every line. The workflow's own timestamps are useless for
+# this — they all record the same instant (when ssh flushed the buffer), so a
+# fresh install's log said nothing about where the minutes went. With this,
+# the next fresh run shows the cost of each stage directly in the log.
+_T0=$(date +%s)
+_TL=$_T0
+log()  {
+  local t; t=$(date +%s)
+  printf '\033[1;36m[pulse]\033[0m %s  \033[2m(+%ss, total %ss)\033[0m\n' \
+    "$*" "$((t - _TL))" "$((t - _T0))"
+  _TL=$t
+}
 ok()   { printf '  \033[1;32mOK\033[0m   %s\n' "$*"; }
 warn() { printf '  \033[1;33mWARN\033[0m %s\n' "$*"; }
 die()  {
@@ -83,8 +94,11 @@ APT_PKGS=(
   websockify socat
   curl wget unzip zip ca-certificates openssl
   iptables
-  build-essential cmake pkg-config git
-  libnspr4-dev libnss3-dev
+  # NB: no build toolchain here. build-essential + cmake + git + nss/nspr
+  # headers are ~90 MB (cmake 40 MB, git 48 MB) and exist only to compile
+  # badvpn — which stage 4 now fetches as a 114 KB prebuilt binary. They are
+  # installed just-in-time in stage 4's source-build fallback instead, so a
+  # normal install never downloads them.
 )
 apt-get update -qq >/dev/null 2>&1 || true
 apt-get install -y -qq "${APT_PKGS[@]}" >/dev/null 2>&1 || {
@@ -190,8 +204,39 @@ systemctl enable xray >/dev/null 2>&1 || true
 ok "xray config valid + unit installed"
 
 # --- 4. badvpn -------------------------------------------------------------
-log "4/11 badvpn-udpgw (built from source)"
-if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
+log "4/11 badvpn-udpgw"
+BADVPN_BIN=/usr/local/bin/badvpn-udpgw
+# A 114 KB binary is committed to the repo, so the normal install never
+# clones, configures or compiles anything — and never pulls the ~90 MB of
+# build toolchain out of stage 1's apt list. Measured on a 1-vCPU Debian
+# box: clone 2s + cmake 2s + make 8s = 12s, plus the apt cost of cmake/git/
+# nss headers on a fresh image. The source build below stays as the
+# fallback for when the download is unavailable.
+BADVPN_URL="https://raw.githubusercontent.com/auroratunnel/pulse-tunnel-configs/main/install/badvpn-udpgw"
+
+# Capture the output instead of piping it: `badvpn --help | grep -q` closes
+# the pipe early, SIGPIPEs the binary, and under pipefail that aborts the
+# whole script (exit 141).
+badvpn_runs() {
+  local out
+  [ -f "$1" ] && [ -x "$1" ] || return 1
+  out="$("$1" --help 2>&1 || true)"
+  grep -qi udpgw <<<"$out"
+}
+
+if badvpn_runs "$BADVPN_BIN"; then
+  ok "badvpn already present"
+elif curl -fsSL --connect-timeout 10 --max-time 90 -o "$BADVPN_BIN.part" "$BADVPN_URL" \
+     && install -m 755 "$BADVPN_BIN.part" "$BADVPN_BIN" \
+     && badvpn_runs "$BADVPN_BIN"; then
+  rm -f "$BADVPN_BIN.part"
+  ok "prebuilt badvpn-udpgw installed (114 KB, no compile)"
+else
+  rm -f "$BADVPN_BIN.part"
+  warn "prebuilt download unavailable — falling back to a source build"
+  # Just-in-time: only a fallback build ever needs these.
+  apt-get install -y -qq build-essential cmake pkg-config git libnspr4-dev libnss3-dev \
+    || die "build toolchain install failed"
   tmp=$(mktemp -d)
   blog="$tmp/build.log"
   : >"$blog"
@@ -214,17 +259,17 @@ if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
      && make -C "$tmp/badvpn/build" -j"$(nproc)" >>"$blog" 2>&1; then
     bin="$(find "$tmp/badvpn/build" -type f -name badvpn-udpgw -perm -u+x -print -quit)"
     if [ -n "$bin" ]; then
-      install -m 755 "$bin" /usr/local/bin/badvpn-udpgw
+      install -m 755 "$bin" "$BADVPN_BIN"
     fi
   fi
-  if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
+  if [ ! -x "$BADVPN_BIN" ]; then
     warn "badvpn build failed — last output:"
     tail -25 "$blog" 2>/dev/null | sed 's/^/    /' || true
   fi
   rm -rf "$tmp"
 fi
-[ -x /usr/local/bin/badvpn-udpgw ] || die "badvpn-udpgw build failed"
-/usr/local/bin/badvpn-udpgw --help 2>&1 | head -1 | sed 's/^/    /' || true
+[ -x "$BADVPN_BIN" ] || die "badvpn-udpgw unavailable"
+"$BADVPN_BIN" --help 2>&1 | head -1 | sed 's/^/    /' || true
 ok "badvpn ready"
 
 cat > /etc/systemd/system/badvpn-udpgw@.service <<'UNIT'
@@ -622,7 +667,14 @@ done
 for p in 7100 7200 7300 7400 7500 7600 7700 7800 7900; do
   systemctl restart "badvpn-udpgw@${p}.service" >/dev/null 2>&1 || true
 done
-sleep 3
+# Wait for the core units rather than a flat sleep: normally ready in ~1s
+# (so this saves 2s) and it can never verify against half-started services.
+for _i in 1 2 3 4 5; do
+  if systemctl is-active --quiet nginx && systemctl is-active --quiet xray; then
+    break
+  fi
+  sleep 1
+done
 
 # --- extra: DNS on 53 -------------------------------------------------------
 # A port only counts as open if something listens on a NON-loopback address,
