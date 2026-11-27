@@ -27,7 +27,10 @@ name: Install Pulse Stack on VPS
 # server row that launched it. Top-level `run-name:` accepts expressions —
 # unlike `run:` shell blocks, where GitHub rejects the expression opener (the
 # hazard documented in install/README.md). This line is NOT inside a run: block.
-run-name: Install Pulse Stack on VPS — ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+# The Install/Uninstall prefix is load-bearing: the panel waits for the
+# "Uninstall … <ip>" run to finish before it drops the row, so an older
+# completed Install run for the same box can never satisfy that wait.
+run-name: "${{ (github.event.client_payload.action == 'uninstall' || github.event.inputs.action == 'uninstall') && 'Uninstall' || 'Install' }} Pulse Stack on VPS — ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}"
 
 on:
   repository_dispatch:
@@ -47,6 +50,14 @@ on:
         required: false
         type: string
         default: ""
+      action:
+        description: "install the stack, or uninstall it (SSH is never touched)"
+        required: false
+        type: choice
+        options:
+          - install
+          - uninstall
+        default: install
 
 concurrency:
   group: pulse-install
@@ -54,14 +65,16 @@ concurrency:
 
 jobs:
   install:
-    name: Install on VPS
+    name: "${{ (github.event.client_payload.action == 'uninstall' || github.event.inputs.action == 'uninstall') && 'Uninstall from VPS' || 'Install on VPS' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
-    # Only the non-secret target IP lives at job level. The password and the
-    # PKI are deliberately NOT here — see the header comment.
+    # Only the non-secret target IP and the install/uninstall mode live at job
+    # level. The password and the PKI are deliberately NOT here — see the
+    # header comment.
     env:
       VPS_IP: ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+      ACTION: ${{ github.event.client_payload.action || github.event.inputs.action || 'install' }}
 
     steps:
       # MUST stay first, and MUST stay free of any `env:` block.
@@ -102,7 +115,12 @@ jobs:
           if ! printf '%s' "$VPS_IP" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
             echo "::error::vps_ip is not an IPv4 address"; exit 1
           fi
-          echo "Target: $VPS_IP"
+          # The mode decides which script is launched below, so reject anything
+          # unexpected here instead of failing later on a confusing path error.
+          if [ "$ACTION" != "install" ] && [ "$ACTION" != "uninstall" ]; then
+            echo "::error::action must be install or uninstall (got: $ACTION)"; exit 1
+          fi
+          echo "Target: $VPS_IP — $ACTION"
 
       - name: Checkout installer
         uses: actions/checkout@v4
@@ -129,7 +147,7 @@ jobs:
 
           # shellcheck disable=SC2086
           SSHPASS="$VPS_PASSWORD" sshpass -e scp $SSH_OPTS \
-            install/pulse-install.sh "root@${VPS_IP}:/tmp/pulse-install.sh"
+            install/pulse-install.sh install/pulse-uninstall.sh "root@${VPS_IP}:/tmp/"
 
           # The shared OpenVPN CA, if the panel supplied one: reusing it is what
           # keeps the already-shipped client profiles verifying against the new
@@ -163,34 +181,36 @@ jobs:
           fi
 
           # Detached inside the session so a transient TCP reset cannot kill the
-          # install halfway; we then poll its log to completion.
+          # job halfway; we then poll its log to completion. The script path
+          # follows ACTION (pulse-install.sh / pulse-uninstall.sh); the poll and
+          # result patterns accept either mode's verdict pair.
           # shellcheck disable=SC2086
           SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
-            "rm -f /tmp/pulse-install.log; nohup bash /tmp/pulse-install.sh --ip ${VPS_IP} ${PKI_ARG} >/tmp/pulse-install.log 2>&1 & echo LAUNCHED"
+            "rm -f /tmp/pulse-${ACTION}.log; nohup bash /tmp/pulse-${ACTION}.sh --ip ${VPS_IP} ${PKI_ARG} >/tmp/pulse-${ACTION}.log 2>&1 & echo LAUNCHED"
 
           for i in $(seq 1 150); do
             sleep 10
             # shellcheck disable=SC2086
             STATE=$(SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
-              'grep -qE "ALL PORTS ACTIVE|SOME PORTS MISSING" /tmp/pulse-install.log 2>/dev/null && echo DONE || echo RUNNING' \
+              "grep -qE 'ALL PORTS ACTIVE|SOME PORTS MISSING|PULSE UNINSTALLED|UNINSTALL INCOMPLETE' /tmp/pulse-${ACTION}.log 2>/dev/null && echo DONE || echo RUNNING" \
               2>/dev/null || echo SSH_BLIP)
             echo "poll $i: $STATE"
             [ "$STATE" = "DONE" ] && break
           done
 
-          echo "=== install log ==="
+          echo "=== ${ACTION} log ==="
           # shellcheck disable=SC2086
           SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
-            'cat /tmp/pulse-install.log' 2>/dev/null || true
+            "cat /tmp/pulse-${ACTION}.log" 2>/dev/null || true
 
           echo "=== result ==="
           # shellcheck disable=SC2086
           RESULT=$(SSHPASS="$VPS_PASSWORD" sshpass -e ssh $SSH_OPTS "root@${VPS_IP}" \
-            'grep -c "ALL PORTS ACTIVE" /tmp/pulse-install.log 2>/dev/null || true' 2>/dev/null || echo 0)
+            "grep -cE 'ALL PORTS ACTIVE|PULSE UNINSTALLED' /tmp/pulse-${ACTION}.log 2>/dev/null || true" 2>/dev/null || echo 0)
           if [ "${RESULT:-0}" -ge 1 ]; then
-            echo "::notice::Install complete — all ports active on $VPS_IP"
+            echo "::notice::${ACTION} complete on $VPS_IP"
           else
-            echo "::error::Install did not report ALL PORTS ACTIVE on $VPS_IP"
+            echo "::error::${ACTION} did not report its success verdict on $VPS_IP (log above)"
             exit 1
           fi
 
@@ -199,11 +219,39 @@ jobs:
       # VPS cannot prove about itself: the ports answer a third party, and the
       # DNS ACL actually refuses a public source (i.e. we did not accidentally
       # create an open resolver — which would get the IP blocklisted).
+      # For an uninstall the proof is inverted: every stack port must now be
+      # CLOSED to a third party, and 22 must still be OPEN — SSH surviving is
+      # the one thing that can never be allowed to regress.
       - name: Verify from outside the VPS
         env:
           VPS_IP: ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+          ACTION: ${{ github.event.client_payload.action || github.event.inputs.action || 'install' }}
         run: |
           set -euo pipefail
+
+          if [ "$ACTION" = "uninstall" ]; then
+            echo "Probing $VPS_IP from GitHub's network — stack gone, SSH survived:"
+            if timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_IP/22" 2>/dev/null; then
+              echo "  tcp 22  OPEN (SSH survived — the box is still reachable)"
+            else
+              echo "::error::tcp 22 is no longer reachable — SSH did not survive the uninstall"
+              exit 1
+            fi
+            # These ports only answer if OUR stack still holds them: a
+            # successful install proved we bound them, so an open port here
+            # means the uninstall left something behind.
+            for p in 80 81 443 8080 222 777 8443; do
+              if timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_IP/$p" 2>/dev/null; then
+                echo "::error::tcp $p is still open after the uninstall"
+                exit 1
+              else
+                echo "  tcp $p  closed"
+              fi
+            done
+            echo "external verification passed (stack removed, SSH alive)"
+            exit 0
+          fi
+
           echo "Probing $VPS_IP from GitHub's network, not from the VPS itself:"
 
           for p in 53 8080 80 443; do
