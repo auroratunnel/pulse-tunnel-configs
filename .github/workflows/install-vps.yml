@@ -23,6 +23,12 @@
 # =============================================================================
 name: Install Pulse Stack on VPS
 
+# Embed the target IP in the run title so the panel can map a run back to the
+# server row that launched it. Top-level `run-name:` accepts expressions —
+# unlike `run:` shell blocks, where GitHub rejects the expression opener (the
+# hazard documented in install/README.md). This line is NOT inside a run: block.
+run-name: Install Pulse Stack on VPS — ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+
 on:
   repository_dispatch:
     types: [install-vps]
