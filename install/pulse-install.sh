@@ -22,7 +22,8 @@
 #            in the shipped client profiles — without it, existing profiles
 #            would fail server verification.
 # =============================================================================
-set -euo pipefail
+# -E so the ERR trap below is inherited by functions and subshells.
+set -Eeuo pipefail
 
 IP=""
 PKI_B64=""
@@ -41,7 +42,22 @@ done
 log()  { printf '\033[1;36m[pulse]\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[1;32mOK\033[0m   %s\n' "$*"; }
 warn() { printf '  \033[1;33mWARN\033[0m %s\n' "$*"; }
-die()  { printf '  \033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+die()  {
+  printf '  \033[1;31mFAIL\033[0m %s\n' "$*" >&2
+  # The workflow polls this log for a verdict (ALL PORTS ACTIVE / SOME PORTS
+  # MISSING). An abort that writes neither leaves it polling for the full
+  # 25-minute window; emitting one here makes the run fail in seconds while
+  # still showing the real reason.
+  printf 'SOME PORTS MISSING — aborted: %s\n' "$*"
+  exit 1
+}
+
+# Same verdict for an unexpected `set -e` abort that never reached die().
+on_abort() {
+  printf '  \033[1;31mFAIL\033[0m unexpected error (exit %s) at line %s\n' "$2" "$1" >&2
+  printf 'SOME PORTS MISSING — unexpected error at line %s\n' "$1"
+}
+trap 'on_abort "$LINENO" "$?"' ERR
 
 # --- preflight -------------------------------------------------------------
 [ "$(id -u)" = "0" ] || die "must run as root"
@@ -177,12 +193,34 @@ ok "xray config valid + unit installed"
 log "4/11 badvpn-udpgw (built from source)"
 if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
   tmp=$(mktemp -d)
-  git clone --depth 1 https://github.com/ambrop72/badvpn.git "$tmp/badvpn" >/dev/null 2>&1
-  ( cd "$tmp/badvpn" \
-    && mkdir -p build && cd build \
-    && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_BADVPN-UDPGW=1 >/dev/null 2>&1 \
-    && make -j"$(nproc)" >/dev/null 2>&1 \
-    && install -m 755 badvpn-udpgw /usr/local/bin/badvpn-udpgw )
+  blog="$tmp/build.log"
+  : >"$blog"
+  # Two bugs, both only reachable on a FRESH box — on the reference VPS the
+  # binary already existed, so this path never ran there and both went
+  # unnoticed until the first new-server install:
+  #   1. the CMake option is BUILD_UDPGW; there is no BUILD_BADVPN-UDPGW.
+  #      CMake accepts the bogus name silently, BUILD_NOTHING_BY_DEFAULT then
+  #      leaves every component OFF, and `make` exits 0 having built nothing.
+  #   2. udpgw comes from add_subdirectory(udpgw), so the binary is produced
+  #      at build/udpgw/badvpn-udpgw — installing `badvpn-udpgw` from the
+  #      build root always failed with ENOENT.
+  # Build output goes to a log rather than /dev/null so a future failure is
+  # actually visible instead of surfacing as a bare "cannot stat".
+  if git clone --depth 1 https://github.com/ambrop72/badvpn.git "$tmp/badvpn" >>"$blog" 2>&1 \
+     && ( cd "$tmp/badvpn" \
+          && mkdir -p build && cd build \
+          && cmake .. -DCMAKE_BUILD_TYPE=Release \
+               -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 ) >>"$blog" 2>&1 \
+     && make -C "$tmp/badvpn/build" -j"$(nproc)" >>"$blog" 2>&1; then
+    bin="$(find "$tmp/badvpn/build" -type f -name badvpn-udpgw -perm -u+x -print -quit)"
+    if [ -n "$bin" ]; then
+      install -m 755 "$bin" /usr/local/bin/badvpn-udpgw
+    fi
+  fi
+  if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
+    warn "badvpn build failed — last output:"
+    tail -25 "$blog" 2>/dev/null | sed 's/^/    /' || true
+  fi
   rm -rf "$tmp"
 fi
 [ -x /usr/local/bin/badvpn-udpgw ] || die "badvpn-udpgw build failed"
