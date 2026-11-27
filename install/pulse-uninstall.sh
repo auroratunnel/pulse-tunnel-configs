@@ -92,14 +92,29 @@ SVC=(
   xray ssh-ws stunnel4 nginx unbound
   openvpn-server@pulse openvpn-server@pulse1194
 )
+# disable and stop are two separate calls, mirroring how the installer starts
+# them (enable, then restart). A combined `disable --now` proved NOT to stop
+# the SysV-wrapped stunnel4 unit on the reference box — it stayed active and
+# failed verification.
 for u in "${SVC[@]}"; do
-  systemctl disable --now "$u" >/dev/null 2>&1 || true
+  systemctl disable "$u" >/dev/null 2>&1 || true
+  systemctl stop "$u" >/dev/null 2>&1 || true
 done
 for p in 7100 7200 7300 7400 7500 7600 7700 7800 7900; do
-  systemctl disable --now "badvpn-udpgw@${p}.service" >/dev/null 2>&1 || true
+  systemctl disable "badvpn-udpgw@${p}.service" >/dev/null 2>&1 || true
+  systemctl stop "badvpn-udpgw@${p}.service" >/dev/null 2>&1 || true
 done
 systemctl reset-failed >/dev/null 2>&1 || true
-ok "services stopped and disabled"
+
+# A unit can go inactive while its daemon lives on: systemd-sysv-generator
+# gives stunnel4 KillMode=process with GuessMainPID=no, so systemd has nothing
+# to kill and the init script's stop misses the pidfile — observed on the
+# reference box (unit inactive, /usr/bin/stunnel4 still holding 222/777).
+# Sweep by exact process name; only processes this stack creates match.
+for p in stunnel4 xray badvpn-udpgw openvpn; do
+  pkill -x "$p" >/dev/null 2>&1 || true
+done
+ok "services stopped and disabled, leftover daemons swept"
 
 # --- unit files --------------------------------------------------------------
 log "removing unit files"
@@ -252,6 +267,17 @@ for u in xray ssh-ws stunnel4 nginx unbound \
   fi
 done
 ok "all stack services stopped"
+
+# 2b) and no daemon of ours may still be a live process — a unit can be
+#     inactive while its process survives (the SysV-wrapper case the sweep
+#     above exists for). Every one of these also binds a port, so step 3 is
+#     the backstop, but failing here names the culprit directly.
+for p in stunnel4 xray badvpn-udpgw openvpn; do
+  if pgrep -x "$p" >/dev/null 2>&1; then
+    die "process $p is still running"
+  fi
+done
+ok "no stack daemons left running"
 
 # 3) none of our ports may still be bound (loopback included — xray and the
 #    nginx TLS backend listen on 127.0.0.1 and count as "still installed")
