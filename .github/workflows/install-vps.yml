@@ -187,3 +187,52 @@ jobs:
             echo "::error::Install did not report ALL PORTS ACTIVE on $VPS_IP"
             exit 1
           fi
+
+      # The installer's own checks can only prove a socket is not bound to
+      # loopback. This runs from GitHub's network, so it proves two things the
+      # VPS cannot prove about itself: the ports answer a third party, and the
+      # DNS ACL actually refuses a public source (i.e. we did not accidentally
+      # create an open resolver — which would get the IP blocklisted).
+      - name: Verify from outside the VPS
+        env:
+          VPS_IP: ${{ github.event.client_payload.vps_ip || github.event.inputs.vps_ip }}
+        run: |
+          set -euo pipefail
+          echo "Probing $VPS_IP from GitHub's network, not from the VPS itself:"
+
+          for p in 53 8080 80 443; do
+            if timeout 8 bash -c "exec 3<>/dev/tcp/$VPS_IP/$p" 2>/dev/null; then
+              echo "  tcp $p  OPEN"
+            else
+              echo "::error::tcp $p is not reachable from outside"
+              exit 1
+            fi
+          done
+
+          echo "HTTP on 8080:"
+          curl -sS -m 10 "http://$VPS_IP:8080/" | head -1 | sed 's/^/  /'
+
+          echo "DNS on 53 (a public source must be REFUSED, never answered):"
+          python3 - "$VPS_IP" <<'PYEOF'
+          import socket, struct, random, sys
+          srv = sys.argv[1]
+          pkt = struct.pack(">HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 0)
+          for lab in b"example.com".split(b"."):
+              pkt += struct.pack("B", len(lab)) + lab
+          pkt += b"\x00" + struct.pack(">HH", 1, 1)
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          s.settimeout(8)
+          try:
+              s.sendto(pkt, (srv, 53))
+              data, addr = s.recvfrom(4096)
+          except socket.timeout:
+              print("  no reply (filtered) — fine, that is not an open resolver")
+              sys.exit(0)
+          rcode = struct.unpack(">H", data[2:4])[0] & 0xF
+          if rcode == 5:
+              print("  REFUSED as expected — this host is NOT an open resolver")
+          else:
+              print("  rcode=%d from %s — answered a public source: OPEN RESOLVER" % (rcode, addr))
+              sys.exit(1)
+          PYEOF
+          echo "external verification passed"

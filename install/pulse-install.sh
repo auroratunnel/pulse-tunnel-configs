@@ -8,6 +8,7 @@
 #   443  nginx stream SNI router 7100-7900 badvpn-udpgw (9)
 #   8443 OpenVPN tcp            1194/udp  OpenVPN
 #   10001-10021 Xray inbounds   10080     websockify (SSH over WS)
+#   53   DNS (unbound)          8080     nginx alt-HTTP (WS/gRPC fallback)
 #   VLESS/VMess/Trojan/SS  WS+gRPC over 80/443
 #
 # SAFE TO RE-RUN: every step is idempotent. Re-running on an already-configured
@@ -262,6 +263,14 @@ server {
         return 200 "Pulse Tunnel nginx :81 OK\n";
         add_header Content-Type text/plain;
     }
+}
+
+# Alt HTTP on 8080: same locations as 80, so it doubles as a fallback path to
+# every WS/gRPC inbound if 80 gets blocked upstream.
+server {
+    listen 8080;
+    server_name _;
+    include /etc/nginx/pulse-locations.conf;
 }
 NGINX
 
@@ -552,6 +561,66 @@ for p in 7100 7200 7300 7400 7500 7600 7700 7800 7900; do
 done
 sleep 3
 
+# --- extra: DNS on 53 -------------------------------------------------------
+# A port only counts as open if something listens on a NON-loopback address,
+# so 53 needs a service bound to a routable address.
+#
+# Two traps this avoids:
+#   * systemd-resolved always holds 127.0.0.53:53 (and 127.0.0.54:53). A naive
+#     "is :53 listening?" test matches those and reports the port open while it
+#     stays closed to the outside — so the test below ignores 127.* / [::1].
+#   * binding 0.0.0.0:53 on such a box fails with EADDRINUSE, so unbound is
+#     bound to the public IP instead. System DNS (/etc/resolv.conf ->
+#     127.0.0.53) is left completely alone.
+#
+# unbound rather than a plain forwarder because it can refuse the public while
+# still serving allowed ranges: a VPS IP that answers arbitrary DNS recursion
+# tends to land on blocklists, which would break the very stack this installs.
+# NB: deliberately NO 192.168.0.0/16 or 172.16.0.0/12 entries. Those look
+# harmless but cover the egress address of countless NAT/VPN clients, so
+# allowing them would effectively re-create the open resolver we are avoiding.
+ext_listens() {
+  # $1 = tcp|udp, $2 = port. Local address is column 4 of `ss ... -H`.
+  local proto="$1" port="$2" out
+  if [ "$proto" = tcp ]; then out="$(ss -tlnH 2>/dev/null || true)"
+  else out="$(ss -ulnH 2>/dev/null || true)"; fi
+  # NB: capture first, then awk a herestring. `ss | grep -q` closes the pipe
+  # early, SIGPIPEs ss, and under pipefail that aborts the script (exit 141).
+  awk -v p=":$port" '
+    $4 ~ p"$" && $4 !~ /^127\./ && $4 !~ /^\[::1\]/ { found=1 }
+    END { exit !found }' <<<"$out"
+}
+
+if ext_listens tcp 53 || ext_listens udp 53; then
+  ok "port 53 already reachable from outside — leaving it untouched"
+else
+  log "extra/11 DNS on 53 (unbound, ACL-restricted)"
+  apt-get install -y -qq unbound >/dev/null 2>&1 || warn "unbound install failed"
+  mkdir -p /etc/unbound/unbound.conf.d
+  # Unquoted terminator: interface: below must expand to this host's IP.
+  cat > /etc/unbound/unbound.conf.d/pulse.conf <<UNBOUND
+server:
+    interface: $IP
+    access-control: 127.0.0.0/8 allow
+    access-control: $IP/32 allow
+    access-control: 10.8.0.0/24 allow
+    access-control: 10.8.1.0/24 allow
+    access-control: 0.0.0.0/0 refuse
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+    prefetch: yes
+UNBOUND
+  systemctl enable unbound >/dev/null 2>&1 || true
+  systemctl restart unbound >/dev/null 2>&1 || warn "unbound restart"
+  sleep 1
+  if systemctl is-active --quiet unbound 2>/dev/null; then
+    ok "unbound on $IP:53 — allowed sources resolve, everyone else REFUSED"
+  else
+    warn "unbound did not start — port 53 will report MISSING below"
+  fi
+fi
+
 # --- verify ----------------------------------------------------------------
 if [ "$SKIP_VERIFY" = "1" ]; then
   log "install finished (--skip-verify)"
@@ -587,6 +656,12 @@ for p in 10001 10002 10003 10004 10011 10012 10013 10014 10021; do
 done
 check_tcp 10080 "websockify (SSH over WS)"
 check_tcp 10443 "nginx TLS backend"
+# 8080 and 53 must be reachable from OUTSIDE, so they use ext_listens (which
+# ignores loopback). check_tcp would happily pass on 127.0.0.53:53 while the
+# port stayed closed to the world.
+if ext_listens tcp 8080; then ok "TCP 8080  nginx alt-HTTP (WS/gRPC fallback)"; else warn "TCP 8080  nginx alt-HTTP MISSING"; FAIL=1; fi
+if ext_listens tcp 53; then ok "TCP 53    DNS (unbound)"; else warn "TCP 53    DNS MISSING"; FAIL=1; fi
+if ext_listens udp 53; then ok "UDP 53    DNS (unbound)"; else warn "UDP 53    DNS MISSING"; FAIL=1; fi
 
 echo
 if [ "$FAIL" = "0" ]; then
