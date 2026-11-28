@@ -290,3 +290,54 @@ jobs:
               sys.exit(1)
           PYEOF
           echo "external verification passed"
+
+      # ---- Report the outcome to the panel -------------------------------
+      # The payload lifecycle must not depend on an open (and up-to-date)
+      # browser tab: on install success the panel points every payload at
+      # this VPS and republishes the bundle; on uninstall success it drops
+      # this VPS's payloads. Callback failures only warn — the box work has
+      # already happened and the panel still offers Install/Publish to
+      # recover by hand.
+      - name: Report install to panel (repoint payloads)
+        if: env.ACTION != 'uninstall'
+        env:
+          LIFECYCLE_TOKEN: ${{ secrets.WORKFLOW_SHARED_TOKEN }}
+        run: |
+          if [ -z "$LIFECYCLE_TOKEN" ]; then
+            echo "::warning::WORKFLOW_SHARED_TOKEN missing in repo secrets — panel callback skipped"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/panel_cb.json -w '%{http_code}' -m 60 -X POST \
+            -H "X-Lifecycle-Token: $LIFECYCLE_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"ip\": \"$VPS_IP\"}" \
+            "https://pulse-tunnel-admin.auroratunnel.workers.dev/api/vps/repoint" || echo 000)
+          echo "panel repoint callback -> HTTP $code"
+          cat /tmp/panel_cb.json 2>/dev/null || true
+          echo
+          case "$code" in
+            2*) echo "payloads now point at $VPS_IP" ;;
+            *) echo "::warning::panel callback failed — payloads may still point at the old VPS; run Publish/Install from the panel" ;;
+          esac
+
+      - name: Report uninstall to panel (drop this VPS's payloads)
+        if: env.ACTION == 'uninstall'
+        env:
+          LIFECYCLE_TOKEN: ${{ secrets.WORKFLOW_SHARED_TOKEN }}
+        run: |
+          if [ -z "$LIFECYCLE_TOKEN" ]; then
+            echo "::warning::WORKFLOW_SHARED_TOKEN missing in repo secrets — panel callback skipped"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/panel_cb.json -w '%{http_code}' -m 60 -X POST \
+            -H "X-Lifecycle-Token: $LIFECYCLE_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "{\"ip\": \"$VPS_IP\"}" \
+            "https://pulse-tunnel-admin.auroratunnel.workers.dev/api/vps/forget-configs" || echo 000)
+          echo "panel forget callback -> HTTP $code"
+          cat /tmp/panel_cb.json 2>/dev/null || true
+          echo
+          case "$code" in
+            2*) echo "payloads of $VPS_IP dropped from the panel" ;;
+            *) echo "::warning::panel callback failed — payloads of $VPS_IP may remain; check the panel" ;;
+          esac
