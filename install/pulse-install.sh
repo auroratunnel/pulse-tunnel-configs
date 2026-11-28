@@ -378,7 +378,20 @@ location = /tyxyws {
     proxy_send_timeout 3600s;
 }
 # ---- VLESS over XHTTP ----
+# Exact match for the bare path; prefix match (with trailing slash) for the
+# session subpaths /xhttp_vless_juan/<session>[/seq]. The trailing slash on
+# the location is required: without it proxy_pass substitution produced a
+# double slash upstream (//<session>), which xray parsed as an empty session
+# id and the tunnel never established.
 location = /xhttp_vless_juan {
+    proxy_pass http://127.0.0.1:10021/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+location /xhttp_vless_juan/ {
     proxy_pass http://127.0.0.1:10021/;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
